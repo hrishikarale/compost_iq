@@ -2,15 +2,20 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy import desc
+from datetime import datetime, timedelta
 import os
 import json
 
 from google import genai
 
 from app.db import engine
-from app.models import SensorData
+from app.models import Base, SensorData, AIAnalysis
 
 app = FastAPI()
+
+# Create tables automatically
+Base.metadata.create_all(bind=engine)
+
 SessionLocal = sessionmaker(bind=engine)
 
 BATCH_SETUP = {
@@ -28,6 +33,12 @@ BATCH_SETUP = {
     "start_moisture_state": "Good"
 }
 
+GEMINI_MODEL = "gemini-2.5-flash"
+
+# Development/demo settings
+GEMINI_MIN_INTERVAL_MINUTES = 5
+GEMINI_MIN_NEW_ROWS = 10
+
 
 class SensorInput(BaseModel):
     temperature: float
@@ -35,16 +46,20 @@ class SensorInput(BaseModel):
     humidity: float
 
 
+def clamp(value, minimum, maximum):
+    return max(minimum, min(maximum, int(value)))
+
+
 def fallback_analysis(latest):
     if latest.moisture < 40:
-        action = "Add Water"
         moisture_state = "Dry"
+        action = "Add Water"
     elif latest.moisture <= 70:
-        action = "Keep Monitoring"
         moisture_state = "Good"
+        action = "Keep Monitoring"
     else:
-        action = "Add Dry Material"
         moisture_state = "Wet"
+        action = "Add Dry Material"
 
     if latest.temperature < 35:
         phase = "Mesophilic"
@@ -53,37 +68,265 @@ def fallback_analysis(latest):
     else:
         phase = "Cooling"
 
-    health = round((latest.moisture + min(latest.temperature, 55)) / 2)
-    maturity = min(100, max(0, health + 10))
-    ready_days = max(1, round((100 - maturity) / 5))
+    moisture_score = 100 - abs(55 - latest.moisture) * 2
+    temp_score = 100 - abs(40 - latest.temperature) * 2
+    humidity_score = 100 - abs(50 - latest.humidity)
+
+    health = round(
+        max(0, min(100, (moisture_score * 0.45) + (temp_score * 0.35) + (humidity_score * 0.20)))
+    )
+
+    maturity = clamp(health // 2, 0, 100)
+    ready_days = clamp(round(70 - (maturity * 0.6)), 1, 90)
 
     return {
-        "source": "fallback",
         "maturity": maturity,
         "health": health,
         "phase": phase,
         "ready_days": ready_days,
         "next_action": action,
         "confidence": 60,
-        "reason": "Fallback rule-based analysis used.",
-        "moisture_state": moisture_state
+        "reason": f"Fallback used. Moisture is {moisture_state}.",
+        "source": "fallback",
+        "model_name": "rule-based"
     }
 
 
-def validate_ai_output(data):
-    required = ["maturity", "health", "phase", "ready_days", "next_action", "confidence", "reason"]
+def validate_ai_output(data, previous_ai=None):
+    required = [
+        "maturity",
+        "health",
+        "phase",
+        "ready_days",
+        "next_action",
+        "confidence",
+        "reason"
+    ]
 
     for key in required:
         if key not in data:
-            raise ValueError(f"Missing key: {key}")
+            raise ValueError(f"Missing key from Gemini response: {key}")
 
-    data["maturity"] = int(max(0, min(100, data["maturity"])))
-    data["health"] = int(max(0, min(100, data["health"])))
-    data["ready_days"] = int(max(1, data["ready_days"]))
-    data["confidence"] = int(max(0, min(100, data["confidence"])))
+    allowed_phases = ["Mesophilic", "Thermophilic", "Cooling", "Maturing"]
+    allowed_actions = ["Add Water", "Add Dry Material", "Turn Compost", "Keep Monitoring"]
 
-    data["source"] = "gemini"
-    return data
+    maturity = clamp(data["maturity"], 0, 100)
+    health = clamp(data["health"], 0, 100)
+    ready_days = clamp(data["ready_days"], 1, 90)
+    confidence = clamp(data["confidence"], 0, 100)
+
+    phase = data["phase"]
+    if phase not in allowed_phases:
+        phase = "Mesophilic"
+
+    next_action = data["next_action"]
+    if next_action not in allowed_actions:
+        next_action = "Keep Monitoring"
+
+    reason = str(data["reason"])[:120]
+
+    # Stability control using previous AI result
+    if previous_ai:
+        previous_maturity = previous_ai.maturity
+        previous_ready_days = previous_ai.ready_days
+
+        # Maturity should not jump too wildly
+        if maturity > previous_maturity + 8:
+            maturity = previous_maturity + 8
+        if maturity < previous_maturity - 3:
+            maturity = previous_maturity - 3
+
+        # Ready days should not jump randomly
+        if ready_days > previous_ready_days + 10:
+            ready_days = previous_ready_days + 10
+        if ready_days < previous_ready_days - 10:
+            ready_days = previous_ready_days - 10
+
+        maturity = clamp(maturity, 0, 100)
+        ready_days = clamp(ready_days, 1, 90)
+
+    return {
+        "maturity": maturity,
+        "health": health,
+        "phase": phase,
+        "ready_days": ready_days,
+        "next_action": next_action,
+        "confidence": confidence,
+        "reason": reason,
+        "source": "gemini",
+        "model_name": GEMINI_MODEL
+    }
+
+
+def ai_analysis_to_dict(row):
+    return {
+        "id": row.id,
+        "batch_id": row.batch_id,
+        "sensor_data_id": row.sensor_data_id,
+        "maturity": row.maturity,
+        "health": row.health,
+        "phase": row.phase,
+        "ready_days": row.ready_days,
+        "next_action": row.next_action,
+        "confidence": row.confidence,
+        "reason": row.reason,
+        "source": row.source,
+        "model_name": row.model_name,
+        "created_at": row.created_at
+    }
+
+
+def save_ai_analysis(db, latest, result):
+    new_ai = AIAnalysis(
+        batch_id=BATCH_SETUP["batch_id"],
+        sensor_data_id=latest.id,
+        maturity=result["maturity"],
+        health=result["health"],
+        phase=result["phase"],
+        ready_days=result["ready_days"],
+        next_action=result["next_action"],
+        confidence=result["confidence"],
+        reason=result["reason"],
+        source=result["source"],
+        model_name=result["model_name"]
+    )
+
+    db.add(new_ai)
+    db.commit()
+    db.refresh(new_ai)
+
+    return new_ai
+
+
+def should_run_gemini(latest, previous_ai, sensor_count_after_previous):
+    if not previous_ai:
+        return True, "No previous AI analysis exists."
+
+    age = datetime.utcnow() - previous_ai.created_at
+
+    if age >= timedelta(minutes=GEMINI_MIN_INTERVAL_MINUTES):
+        return True, "Minimum AI time interval passed."
+
+    if sensor_count_after_previous >= GEMINI_MIN_NEW_ROWS:
+        return True, "Enough new sensor rows collected."
+
+    if latest.temperature > 60 or latest.temperature < 15:
+        return True, "Critical temperature detected."
+
+    if latest.moisture > 85 or latest.moisture < 25:
+        return True, "Critical moisture detected."
+
+    return False, "Gemini skipped to save tokens."
+
+
+def run_gemini_analysis(db, latest, previous_ai):
+    api_key = os.getenv("GEMINI_API_KEY")
+
+    if not api_key:
+        return fallback_analysis(latest)
+
+    first_20_rows = db.query(SensorData).order_by(SensorData.id).limit(20).all()
+    latest_20_rows = db.query(SensorData).order_by(desc(SensorData.id)).limit(20).all()
+
+    first_20 = [
+        {
+            "id": r.id,
+            "temperature": r.temperature,
+            "moisture": r.moisture,
+            "humidity": r.humidity,
+            "timestamp": str(r.timestamp)
+        }
+        for r in first_20_rows
+    ]
+
+    latest_20 = [
+        {
+            "id": r.id,
+            "temperature": r.temperature,
+            "moisture": r.moisture,
+            "humidity": r.humidity,
+            "timestamp": str(r.timestamp)
+        }
+        for r in reversed(latest_20_rows)
+    ]
+
+    previous_ai_data = None
+    if previous_ai:
+        previous_ai_data = ai_analysis_to_dict(previous_ai)
+
+    prompt = f"""
+You are CompostIQ AI, an expert compost monitoring assistant.
+
+You must analyze a small compost batch using:
+1. Initial batch setup
+2. First 20 sensor readings as baseline
+3. Latest 20 sensor readings as current trend
+4. Previous AI analysis for consistency
+5. Latest sensor reading
+
+Important stability rules:
+- Do not change ready_days drastically unless sensor readings are critical.
+- Maturity should increase gradually.
+- Health may change based on current conditions.
+- Use previous AI analysis as memory.
+- This is a 400 ml small compost container, so composting may be slower and less hot than large piles.
+
+Batch setup:
+{json.dumps(BATCH_SETUP)}
+
+First 20 sensor readings:
+{json.dumps(first_20)}
+
+Latest 20 sensor readings:
+{json.dumps(latest_20)}
+
+Previous AI analysis:
+{json.dumps(previous_ai_data, default=str)}
+
+Latest reading:
+{{
+  "temperature": {latest.temperature},
+  "moisture": {latest.moisture},
+  "humidity": {latest.humidity}
+}}
+
+Return ONLY valid JSON in exactly this format:
+{{
+  "maturity": 0,
+  "health": 0,
+  "phase": "Mesophilic",
+  "ready_days": 0,
+  "next_action": "Keep Monitoring",
+  "confidence": 0,
+  "reason": "short reason under 20 words"
+}}
+
+Allowed phase values:
+Mesophilic, Thermophilic, Cooling, Maturing
+
+Allowed next_action values:
+Add Water, Add Dry Material, Turn Compost, Keep Monitoring
+"""
+
+    try:
+        client = genai.Client(api_key=api_key)
+
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config={
+                "response_mime_type": "application/json"
+            }
+        )
+
+        ai_data = json.loads(response.text)
+        return validate_ai_output(ai_data, previous_ai)
+
+    except Exception as e:
+        result = fallback_analysis(latest)
+        result["reason"] = f"Gemini failed. {result['reason']}"
+        result["ai_error"] = str(e)[:150]
+        return result
 
 
 @app.get("/")
@@ -94,17 +337,23 @@ def home():
 @app.post("/sensor-data")
 def add_sensor_data(data: SensorInput):
     db = SessionLocal()
+
     try:
         new_entry = SensorData(
             temperature=data.temperature,
             moisture=data.moisture,
             humidity=data.humidity
         )
+
         db.add(new_entry)
         db.commit()
         db.refresh(new_entry)
 
-        return {"message": "Data stored successfully", "data": data.dict()}
+        return {
+            "message": "Data stored successfully",
+            "data": data.model_dump()
+        }
+
     finally:
         db.close()
 
@@ -112,8 +361,10 @@ def add_sensor_data(data: SensorInput):
 @app.get("/latest")
 def get_latest():
     db = SessionLocal()
+
     try:
         latest = db.query(SensorData).order_by(desc(SensorData.id)).first()
+
         if not latest:
             return {"message": "No data found"}
 
@@ -124,6 +375,7 @@ def get_latest():
             "humidity": latest.humidity,
             "timestamp": latest.timestamp
         }
+
     finally:
         db.close()
 
@@ -131,18 +383,21 @@ def get_latest():
 @app.get("/sensor-data")
 def get_all_data():
     db = SessionLocal()
+
     try:
         data = db.query(SensorData).order_by(desc(SensorData.id)).all()
+
         return [
             {
                 "id": d.id,
                 "temperature": d.temperature,
                 "moisture": d.moisture,
                 "humidity": d.humidity,
-                "timestamp": str(d.timestamp)
+                "timestamp": d.timestamp
             }
             for d in data
         ]
+
     finally:
         db.close()
 
@@ -152,73 +407,114 @@ def get_analysis():
     db = SessionLocal()
 
     try:
-        latest = db.query(SensorData).order_by(desc(SensorData.id)).first()
+        latest_ai = db.query(AIAnalysis).order_by(desc(AIAnalysis.id)).first()
 
-        if not latest:
-            return {"message": "No data available"}
+        if latest_ai:
+            return ai_analysis_to_dict(latest_ai)
 
-        sensor_rows = db.query(SensorData).order_by(SensorData.id).limit(20).all()
+        latest_sensor = db.query(SensorData).order_by(desc(SensorData.id)).first()
 
-        sensor_history = [
-            {
-                "id": r.id,
-                "temperature": r.temperature,
-                "moisture": r.moisture,
-                "humidity": r.humidity,
-                "timestamp": str(r.timestamp)
-            }
-            for r in sensor_rows
-        ]
+        if not latest_sensor:
+            return {"message": "No sensor data available"}
 
-        api_key = os.getenv("GEMINI_API_KEY")
+        # No Gemini call here. Only fallback if no saved AI exists.
+        result = fallback_analysis(latest_sensor)
+        saved = save_ai_analysis(db, latest_sensor, result)
 
-        if not api_key:
-            return fallback_analysis(latest)
+        return ai_analysis_to_dict(saved)
 
-        prompt = f"""
-You are CompostIQ AI, an expert compost monitoring assistant.
+    finally:
+        db.close()
 
-Use the batch setup and first 20 sensor readings to estimate compost condition.
 
-Batch setup:
-{json.dumps(BATCH_SETUP)}
+@app.post("/analysis/run")
+def run_analysis(force: bool = False):
+    db = SessionLocal()
 
-Sensor history:
-{json.dumps(sensor_history)}
+    try:
+        latest_sensor = db.query(SensorData).order_by(desc(SensorData.id)).first()
 
-Latest reading:
-temperature={latest.temperature}, moisture={latest.moisture}, humidity={latest.humidity}
+        if not latest_sensor:
+            return {"message": "No sensor data available"}
 
-Return ONLY valid JSON in exactly this format:
-{{
-  "maturity": 0-100,
-  "health": 0-100,
-  "phase": "Mesophilic" or "Thermophilic" or "Cooling" or "Maturing",
-  "ready_days": integer,
-  "next_action": "Add Water" or "Add Dry Material" or "Turn Compost" or "Keep Monitoring" or "short suggested action",
-  "confidence": 0-100,
-  "reason": "short reason under 20 words"
-}}
-"""
+        previous_ai = db.query(AIAnalysis).order_by(desc(AIAnalysis.id)).first()
 
-        try:
-            client = genai.Client(api_key=api_key)
-
-            response = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=prompt,
-                config={
-                    "response_mime_type": "application/json"
-                }
+        sensor_count_after_previous = 0
+        if previous_ai and previous_ai.sensor_data_id:
+            sensor_count_after_previous = (
+                db.query(SensorData)
+                .filter(SensorData.id > previous_ai.sensor_data_id)
+                .count()
             )
 
-            ai_data = json.loads(response.text)
-            return validate_ai_output(ai_data)
+        should_run, reason = should_run_gemini(
+            latest_sensor,
+            previous_ai,
+            sensor_count_after_previous
+        )
 
-        except Exception as e:
-            result = fallback_analysis(latest)
-            result["ai_error"] = str(e)
+        if not force and not should_run and previous_ai:
+            result = ai_analysis_to_dict(previous_ai)
+            result["run_status"] = "skipped"
+            result["skip_reason"] = reason
+            result["new_sensor_rows"] = sensor_count_after_previous
             return result
+
+        result = run_gemini_analysis(db, latest_sensor, previous_ai)
+        saved = save_ai_analysis(db, latest_sensor, result)
+
+        response = ai_analysis_to_dict(saved)
+        response["run_status"] = "created"
+        response["run_reason"] = "Forced run." if force else reason
+        response["new_sensor_rows"] = sensor_count_after_previous
+
+        return response
+
+    finally:
+        db.close()
+
+
+@app.get("/analysis/status")
+def analysis_status():
+    db = SessionLocal()
+
+    try:
+        latest_sensor = db.query(SensorData).order_by(desc(SensorData.id)).first()
+        latest_ai = db.query(AIAnalysis).order_by(desc(AIAnalysis.id)).first()
+
+        if not latest_sensor:
+            return {"message": "No sensor data available"}
+
+        if not latest_ai:
+            return {
+                "latest_sensor_id": latest_sensor.id,
+                "has_ai_analysis": False,
+                "message": "No AI analysis yet. Run POST /analysis/run."
+            }
+
+        sensor_count_after_previous = (
+            db.query(SensorData)
+            .filter(SensorData.id > latest_ai.sensor_data_id)
+            .count()
+        )
+
+        should_run, reason = should_run_gemini(
+            latest_sensor,
+            latest_ai,
+            sensor_count_after_previous
+        )
+
+        return {
+            "latest_sensor_id": latest_sensor.id,
+            "latest_ai_id": latest_ai.id,
+            "latest_ai_source": latest_ai.source,
+            "latest_ai_created_at": latest_ai.created_at,
+            "new_sensor_rows_since_ai": sensor_count_after_previous,
+            "should_run_gemini_now": should_run,
+            "reason": reason,
+            "gemini_interval_minutes": GEMINI_MIN_INTERVAL_MINUTES,
+            "gemini_min_new_rows": GEMINI_MIN_NEW_ROWS
+        }
 
     finally:
         db.close()
