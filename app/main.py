@@ -83,6 +83,55 @@ def get_latest():
         db.close()
 
 
+@app.get("/analysis")
+def get_analysis():
+    db = SessionLocal()
+
+    try:
+        latest = db.query(SensorData).order_by(desc(SensorData.id)).first()
+
+        if not latest:
+            return {"message": "No data available"}
+
+        # ----- AI Logic -----
+
+        if latest.moisture < 40:
+            moisture_state = "Dry"
+            action = "Add Water"
+        elif latest.moisture <= 70:
+            moisture_state = "Good"
+            action = "Keep Monitoring"
+        else:
+            moisture_state = "Wet"
+            action = "Add Dry Material"
+
+        if latest.temperature < 35:
+            phase = "Mesophilic"
+        elif latest.temperature < 55:
+            phase = "Thermophilic"
+        else:
+            phase = "Cooling"
+
+        health_score = round(
+            (latest.moisture + min(latest.temperature, 55)) / 2
+        )
+
+        ready_days = max(1, round((100 - health_score) / 5))
+
+        return {
+            "temperature": latest.temperature,
+            "humidity": latest.humidity,
+            "moisture": latest.moisture,
+            "health_score": health_score,
+            "phase": phase,
+            "moisture_state": moisture_state,
+            "action": action,
+            "ready_in_days": ready_days
+        }
+
+    finally:
+        db.close()
+
 # -----------------------
 # GET ALL SENSOR DATA (HISTORY)
 # -----------------------
