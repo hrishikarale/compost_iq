@@ -760,3 +760,95 @@ def update_batch_setup(data: BatchSetupInput):
 
     finally:
         db.close()
+
+@app.get("/alerts")
+def get_alerts():
+    db = SessionLocal()
+
+    try:
+        latest_sensor = db.query(SensorData).order_by(desc(SensorData.id)).first()
+        latest_ai = db.query(AIAnalysis).order_by(desc(AIAnalysis.id)).first()
+
+        if not latest_sensor:
+            return {
+                "alerts": [
+                    {
+                        "type": "Warning",
+                        "title": "No Sensor Data",
+                        "message": "No sensor readings received yet.",
+                        "severity": "warning"
+                    }
+                ]
+            }
+
+        alerts = []
+
+        # Moisture alerts
+        if latest_sensor.moisture < 30:
+            alerts.append({
+                "type": "Critical",
+                "title": "Moisture Too Low",
+                "message": "Compost is too dry. Add water gradually.",
+                "severity": "critical"
+            })
+
+        elif latest_sensor.moisture > 80:
+            alerts.append({
+                "type": "Warning",
+                "title": "Moisture Too High",
+                "message": "Compost is too wet. Add dry leaves or cardboard.",
+                "severity": "warning"
+            })
+
+        # Temperature alerts
+        if latest_sensor.temperature > 60:
+            alerts.append({
+                "type": "Critical",
+                "title": "Temperature Too High",
+                "message": "Turn compost and improve airflow.",
+                "severity": "critical"
+            })
+
+        elif latest_sensor.temperature < 15:
+            alerts.append({
+                "type": "Warning",
+                "title": "Temperature Too Low",
+                "message": "Compost activity may be slow due to low temperature.",
+                "severity": "warning"
+            })
+
+        # AI action alert
+        if latest_ai and latest_ai.next_action != "Keep Monitoring":
+            alerts.append({
+                "type": "Action",
+                "title": latest_ai.next_action,
+                "message": latest_ai.reason,
+                "severity": "action"
+            })
+
+        # Device offline alert
+        now = datetime.utcnow()
+        if latest_sensor.timestamp and (now - latest_sensor.timestamp).total_seconds() > 600:
+            alerts.append({
+                "type": "Warning",
+                "title": "Device Offline",
+                "message": "No M5Stack sensor data received for more than 10 minutes.",
+                "severity": "warning"
+            })
+
+        if not alerts:
+            alerts.append({
+                "type": "Stable",
+                "title": "No Critical Alerts",
+                "message": "Compost conditions are currently stable.",
+                "severity": "stable"
+            })
+
+        return {
+            "latest_sensor_id": latest_sensor.id,
+            "latest_ai_id": latest_ai.id if latest_ai else None,
+            "alerts": alerts
+        }
+
+    finally:
+        db.close()
