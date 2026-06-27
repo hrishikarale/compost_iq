@@ -518,3 +518,133 @@ def analysis_status():
 
     finally:
         db.close()
+
+@app.get("/analysis/history")
+def analysis_history():
+    db = SessionLocal()
+
+    try:
+        rows = db.query(AIAnalysis).order_by(desc(AIAnalysis.id)).limit(20).all()
+
+        return [
+            {
+                "id": row.id,
+                "batch_id": row.batch_id,
+                "sensor_data_id": row.sensor_data_id,
+                "maturity": row.maturity,
+                "health": row.health,
+                "phase": row.phase,
+                "ready_days": row.ready_days,
+                "next_action": row.next_action,
+                "confidence": row.confidence,
+                "reason": row.reason,
+                "source": row.source,
+                "model_name": row.model_name,
+                "created_at": row.created_at
+            }
+            for row in rows
+        ]
+
+    finally:
+        db.close()
+
+
+@app.get("/dashboard-summary")
+def dashboard_summary():
+    db = SessionLocal()
+
+    try:
+        latest_sensor = db.query(SensorData).order_by(desc(SensorData.id)).first()
+        latest_ai = db.query(AIAnalysis).order_by(desc(AIAnalysis.id)).first()
+
+        sensor_rows = db.query(SensorData).order_by(desc(SensorData.id)).limit(30).all()
+        sensor_rows = list(reversed(sensor_rows))
+
+        ai_rows = db.query(AIAnalysis).order_by(desc(AIAnalysis.id)).limit(10).all()
+
+        if not latest_sensor:
+            return {
+                "message": "No sensor data available",
+                "device": {
+                    "status": "offline",
+                    "last_seen": None
+                }
+            }
+
+        latest_sensor_dict = {
+            "id": latest_sensor.id,
+            "temperature": latest_sensor.temperature,
+            "humidity": latest_sensor.humidity,
+            "moisture": latest_sensor.moisture,
+            "timestamp": latest_sensor.timestamp
+        }
+
+        latest_ai_dict = None
+
+        if latest_ai:
+            latest_ai_dict = {
+                "id": latest_ai.id,
+                "batch_id": latest_ai.batch_id,
+                "sensor_data_id": latest_ai.sensor_data_id,
+                "maturity": latest_ai.maturity,
+                "health": latest_ai.health,
+                "phase": latest_ai.phase,
+                "ready_days": latest_ai.ready_days,
+                "next_action": latest_ai.next_action,
+                "confidence": latest_ai.confidence,
+                "reason": latest_ai.reason,
+                "source": latest_ai.source,
+                "model_name": latest_ai.model_name,
+                "created_at": latest_ai.created_at
+            }
+
+        now = datetime.utcnow()
+        last_seen = latest_sensor.timestamp
+
+        if last_seen and (now - last_seen).total_seconds() <= 180:
+            device_status = "online"
+        else:
+            device_status = "offline"
+
+        trends = [
+            {
+                "id": row.id,
+                "temperature": row.temperature,
+                "humidity": row.humidity,
+                "moisture": row.moisture,
+                "timestamp": row.timestamp
+            }
+            for row in sensor_rows
+        ]
+
+        recent_ai = [
+            {
+                "id": row.id,
+                "maturity": row.maturity,
+                "health": row.health,
+                "phase": row.phase,
+                "ready_days": row.ready_days,
+                "next_action": row.next_action,
+                "confidence": row.confidence,
+                "reason": row.reason,
+                "source": row.source,
+                "created_at": row.created_at
+            }
+            for row in ai_rows
+        ]
+
+        return {
+            "latest_sensor": latest_sensor_dict,
+            "latest_analysis": latest_ai_dict,
+            "device": {
+                "name": "Compost Pile 1",
+                "status": device_status,
+                "last_seen": latest_sensor.timestamp
+            },
+            "batch_setup": BATCH_SETUP,
+            "trends": trends,
+            "recent_ai": recent_ai
+        }
+
+    finally:
+        db.close()
