@@ -1038,3 +1038,64 @@ def notification_history():
 
     finally:
         db.close()
+
+@app.get("/history-data")
+def history_data(range: str = Query("1d")):
+    db = SessionLocal()
+
+    try:
+        now = datetime.utcnow()
+
+        if range == "1h":
+            start_time = now - timedelta(hours=1)
+        elif range == "6h":
+            start_time = now - timedelta(hours=6)
+        elif range == "1d":
+            start_time = now - timedelta(days=1)
+        elif range == "7d":
+            start_time = now - timedelta(days=7)
+        elif range == "all":
+            start_time = None
+        else:
+            start_time = now - timedelta(days=1)
+
+        sensor_query = db.query(SensorData).order_by(SensorData.timestamp)
+
+        ai_query = db.query(AIAnalysis).order_by(AIAnalysis.created_at)
+
+        if start_time:
+            sensor_query = sensor_query.filter(SensorData.timestamp >= start_time)
+            ai_query = ai_query.filter(AIAnalysis.created_at >= start_time)
+
+        sensor_rows = sensor_query.limit(1000).all()
+        ai_rows = ai_query.limit(500).all()
+
+        return {
+            "range": range,
+            "sensor_data": [
+                {
+                    "id": row.id,
+                    "temperature": row.temperature,
+                    "humidity": row.humidity,
+                    "moisture": row.moisture,
+                    "timestamp": row.timestamp
+                }
+                for row in sensor_rows
+            ],
+            "ai_data": [
+                {
+                    "id": row.id,
+                    "maturity": row.maturity,
+                    "health": row.health,
+                    "phase": row.phase,
+                    "ready_days": row.ready_days,
+                    "next_action": row.next_action,
+                    "confidence": row.confidence,
+                    "created_at": row.created_at
+                }
+                for row in ai_rows
+            ]
+        }
+
+    finally:
+        db.close()
