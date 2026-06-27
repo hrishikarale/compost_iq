@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy import desc
+from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, timedelta
 import os
 import json
@@ -12,6 +13,14 @@ from app.db import engine
 from app.models import Base, SensorData, AIAnalysis
 
 app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 # Create tables automatically
 Base.metadata.create_all(bind=engine)
