@@ -1099,3 +1099,33 @@ def history_data(range: str = Query("1d")):
 
     finally:
         db.close()
+
+@app.post("/notifications/mark-sent/{notification_id}")
+def mark_notification_sent(notification_id: int):
+    db = SessionLocal()
+
+    try:
+        notification = (
+            db.query(NotificationLog)
+            .filter(NotificationLog.id == notification_id)
+            .first()
+        )
+
+        if not notification:
+            return {
+                "success": False,
+                "message": "Notification not found"
+            }
+
+        notification.sent = "yes"
+        db.commit()
+        db.refresh(notification)
+
+        return {
+            "success": True,
+            "message": "Notification marked as sent",
+            "notification": notification_to_dict(notification)
+        }
+
+    finally:
+        db.close()
