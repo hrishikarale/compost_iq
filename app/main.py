@@ -10,7 +10,7 @@ import json
 from google import genai
 
 from app.db import engine
-from app.models import Base, SensorData, AIAnalysis
+from app.models import Base, SensorData, AIAnalysis, BatchSetup
 
 app = FastAPI()
 app.add_middleware(
@@ -54,6 +54,21 @@ class SensorInput(BaseModel):
     moisture: float
     humidity: float
 
+class BatchSetupInput(BaseModel):
+    batch_id: str = "B001"
+    container_ml: float
+
+    dry_leaves_g: float
+    grass_clippings_g: float
+    vegetable_peels_g: float
+    coffee_grounds_g: float
+    cardboard_tissue_g: float
+    twigs_g: float
+
+    start_temp: float | None = None
+    start_humidity: float | None = None
+    start_moisture_raw: float | None = None
+    start_moisture_state: str | None = None
 
 def clamp(value, minimum, maximum):
     return max(minimum, min(maximum, int(value)))
@@ -337,6 +352,50 @@ Add Water, Add Dry Material, Turn Compost, Keep Monitoring
         result["ai_error"] = str(e)[:150]
         return result
 
+def batch_setup_to_dict(row):
+    return {
+        "batch_id": row.batch_id,
+        "container_ml": row.container_ml,
+        "dry_leaves_g": row.dry_leaves_g,
+        "grass_clippings_g": row.grass_clippings_g,
+        "vegetable_peels_g": row.vegetable_peels_g,
+        "coffee_grounds_g": row.coffee_grounds_g,
+        "cardboard_tissue_g": row.cardboard_tissue_g,
+        "twigs_g": row.twigs_g,
+        "start_temp": row.start_temp,
+        "start_humidity": row.start_humidity,
+        "start_moisture_raw": row.start_moisture_raw,
+        "start_moisture_state": row.start_moisture_state,
+        "updated_at": row.updated_at
+    }
+
+
+def get_or_create_batch_setup(db):
+    setup = db.query(BatchSetup).first()
+
+    if setup:
+        return setup
+
+    setup = BatchSetup(
+        batch_id=BATCH_SETUP["batch_id"],
+        container_ml=BATCH_SETUP["container_ml"],
+        dry_leaves_g=BATCH_SETUP["dry_leaves_g"],
+        grass_clippings_g=BATCH_SETUP["grass_clippings_g"],
+        vegetable_peels_g=BATCH_SETUP["vegetable_peels_g"],
+        coffee_grounds_g=BATCH_SETUP["coffee_grounds_g"],
+        cardboard_tissue_g=BATCH_SETUP["cardboard_tissue_g"],
+        twigs_g=BATCH_SETUP["twigs_g"],
+        start_temp=BATCH_SETUP["start_temp"],
+        start_humidity=BATCH_SETUP["start_humidity"],
+        start_moisture_raw=BATCH_SETUP["start_moisture_raw"],
+        start_moisture_state=BATCH_SETUP["start_moisture_state"]
+    )
+
+    db.add(setup)
+    db.commit()
+    db.refresh(setup)
+
+    return setup
 
 @app.get("/")
 def home():
@@ -650,9 +709,53 @@ def dashboard_summary():
                 "status": device_status,
                 "last_seen": latest_sensor.timestamp
             },
-            "batch_setup": BATCH_SETUP,
+            "batch_setup": batch_setup_to_dict(get_or_create_batch_setup(db)),
             "trends": trends,
             "recent_ai": recent_ai
+        }
+
+    finally:
+        db.close()
+
+@app.get("/batch-setup")
+def get_batch_setup():
+    db = SessionLocal()
+
+    try:
+        setup = get_or_create_batch_setup(db)
+        return batch_setup_to_dict(setup)
+
+    finally:
+        db.close()
+
+
+@app.put("/batch-setup")
+def update_batch_setup(data: BatchSetupInput):
+    db = SessionLocal()
+
+    try:
+        setup = get_or_create_batch_setup(db)
+
+        setup.batch_id = data.batch_id
+        setup.container_ml = data.container_ml
+        setup.dry_leaves_g = data.dry_leaves_g
+        setup.grass_clippings_g = data.grass_clippings_g
+        setup.vegetable_peels_g = data.vegetable_peels_g
+        setup.coffee_grounds_g = data.coffee_grounds_g
+        setup.cardboard_tissue_g = data.cardboard_tissue_g
+        setup.twigs_g = data.twigs_g
+        setup.start_temp = data.start_temp
+        setup.start_humidity = data.start_humidity
+        setup.start_moisture_raw = data.start_moisture_raw
+        setup.start_moisture_state = data.start_moisture_state
+        setup.updated_at = datetime.utcnow()
+
+        db.commit()
+        db.refresh(setup)
+
+        return {
+            "message": "Batch setup updated successfully",
+            "batch_setup": batch_setup_to_dict(setup)
         }
 
     finally:
