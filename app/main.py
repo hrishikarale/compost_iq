@@ -10,7 +10,7 @@ import json
 from google import genai
 
 from app.db import engine
-from app.models import Base, SensorData, AIAnalysis, BatchSetup
+from app.models import Base, SensorData, AIAnalysis, BatchSetup, NotificationLog
 
 app = FastAPI()
 app.add_middleware(
@@ -396,6 +396,51 @@ def get_or_create_batch_setup(db):
     db.refresh(setup)
 
     return setup
+
+def notification_to_dict(row):
+    return {
+        "id": row.id,
+        "event_type": row.event_type,
+        "title": row.title,
+        "message": row.message,
+        "action": row.action,
+        "severity": row.severity,
+        "source_ai_id": row.source_ai_id,
+        "source_sensor_id": row.source_sensor_id,
+        "sent": row.sent,
+        "created_at": row.created_at
+    }
+
+
+def create_notification_if_new(db, event_type, title, message, action=None, severity=None, source_ai_id=None, source_sensor_id=None):
+    existing = (
+        db.query(NotificationLog)
+        .filter(NotificationLog.event_type == event_type)
+        .filter(NotificationLog.action == action)
+        .filter(NotificationLog.source_ai_id == source_ai_id)
+        .filter(NotificationLog.source_sensor_id == source_sensor_id)
+        .first()
+    )
+
+    if existing:
+        return existing, False
+
+    notification = NotificationLog(
+        event_type=event_type,
+        title=title,
+        message=message,
+        action=action,
+        severity=severity,
+        source_ai_id=source_ai_id,
+        source_sensor_id=source_sensor_id,
+        sent="no"
+    )
+
+    db.add(notification)
+    db.commit()
+    db.refresh(notification)
+
+    return notification, True
 
 @app.get("/")
 def home():
@@ -849,6 +894,147 @@ def get_alerts():
             "latest_ai_id": latest_ai.id if latest_ai else None,
             "alerts": alerts
         }
+
+    finally:
+        db.close()
+
+@app.get("/notifications/check")
+def check_notifications():
+    db = SessionLocal()
+
+    try:
+        latest_sensor = db.query(SensorData).order_by(desc(SensorData.id)).first()
+        latest_ai = db.query(AIAnalysis).order_by(desc(AIAnalysis.id)).first()
+
+        if not latest_sensor:
+            notification, created = create_notification_if_new(
+                db=db,
+                event_type="offline",
+                title="CompostIQ Sensor Missing",
+                message="No sensor data has been received yet.",
+                severity="warning"
+            )
+
+            return {
+                "should_notify": created,
+                "notification": notification_to_dict(notification)
+            }
+
+        # 1. Critical moisture
+        if latest_sensor.moisture < 30:
+            notification, created = create_notification_if_new(
+                db=db,
+                event_type="critical",
+                title="Compost Too Dry",
+                message="Moisture is too low. Add water gradually.",
+                action="Add Water",
+                severity="critical",
+                source_sensor_id=latest_sensor.id
+            )
+
+            return {
+                "should_notify": created,
+                "notification": notification_to_dict(notification)
+            }
+
+        if latest_sensor.moisture > 80:
+            notification, created = create_notification_if_new(
+                db=db,
+                event_type="critical",
+                title="Compost Too Wet",
+                message="Moisture is too high. Add dry leaves or cardboard.",
+                action="Add Dry Material",
+                severity="critical",
+                source_sensor_id=latest_sensor.id
+            )
+
+            return {
+                "should_notify": created,
+                "notification": notification_to_dict(notification)
+            }
+
+        # 2. Critical temperature
+        if latest_sensor.temperature > 60:
+            notification, created = create_notification_if_new(
+                db=db,
+                event_type="critical",
+                title="Temperature Too High",
+                message="Temperature is too high. Turn compost and improve airflow.",
+                action="Turn Compost",
+                severity="critical",
+                source_sensor_id=latest_sensor.id
+            )
+
+            return {
+                "should_notify": created,
+                "notification": notification_to_dict(notification)
+            }
+
+        # 3. Device offline
+        now = datetime.utcnow()
+
+        if latest_sensor.timestamp and (now - latest_sensor.timestamp).total_seconds() > 600:
+            notification, created = create_notification_if_new(
+                db=db,
+                event_type="offline",
+                title="M5Stack Device Offline",
+                message="No sensor data received for more than 10 minutes.",
+                severity="warning",
+                source_sensor_id=latest_sensor.id
+            )
+
+            return {
+                "should_notify": created,
+                "notification": notification_to_dict(notification)
+            }
+
+        # 4. AI action change / action required
+        if latest_ai and latest_ai.next_action != "Keep Monitoring":
+            previous_same_action = (
+                db.query(NotificationLog)
+                .filter(NotificationLog.event_type == "action")
+                .filter(NotificationLog.action == latest_ai.next_action)
+                .order_by(desc(NotificationLog.id))
+                .first()
+            )
+
+            if not previous_same_action or previous_same_action.source_ai_id != latest_ai.id:
+                notification, created = create_notification_if_new(
+                    db=db,
+                    event_type="action",
+                    title="CompostIQ Action Required",
+                    message=f"{latest_ai.next_action}: {latest_ai.reason}",
+                    action=latest_ai.next_action,
+                    severity="action",
+                    source_ai_id=latest_ai.id,
+                    source_sensor_id=latest_ai.sensor_data_id
+                )
+
+                return {
+                    "should_notify": created,
+                    "notification": notification_to_dict(notification)
+                }
+
+        return {
+            "should_notify": False,
+            "notification": None,
+            "message": "No new notification needed."
+        }
+
+    finally:
+        db.close()
+
+@app.get("/notifications/history")
+def notification_history():
+    db = SessionLocal()
+
+    try:
+        rows = db.query(NotificationLog).order_by(desc(NotificationLog.id)).limit(30).all()
+
+        return [
+            notification_to_dict(row)
+            for row in rows
+        ]
 
     finally:
         db.close()

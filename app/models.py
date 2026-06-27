@@ -58,3 +58,21 @@ class BatchSetup(Base):
     start_moisture_state = Column(String, nullable=True)
 
     updated_at = Column(DateTime, default=datetime.utcnow)
+
+class NotificationLog(Base):
+    __tablename__ = "notification_log"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    event_type = Column(String, nullable=False)      # action / critical / offline
+    title = Column(String, nullable=False)
+    message = Column(Text, nullable=False)
+
+    action = Column(String, nullable=True)
+    severity = Column(String, nullable=True)
+
+    source_ai_id = Column(Integer, nullable=True)
+    source_sensor_id = Column(Integer, nullable=True)
+
+    sent = Column(String, default="no")              # yes / no
+    created_at = Column(DateTime, default=datetime.utcnow)
