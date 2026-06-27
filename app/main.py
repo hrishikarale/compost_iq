@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from pydantic import BaseModel
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy import desc
